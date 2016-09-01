@@ -14,6 +14,7 @@ platforms:
 suites:
   - name: default
     run_list:
+      - recipe[variant_call_rna::_common]
       - recipe[variant_call_rna::default]
     verifier:
       inspec_tests:

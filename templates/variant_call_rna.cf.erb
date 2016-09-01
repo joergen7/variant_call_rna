@@ -1,0 +1,221 @@
+%% Cuneiform Implementation of the GATK Best Practices workflow for variant calling on RNAseq
+%% URL: https://www.broadinstitute.org/gatk/guide/article?id=3891
+%% Runs ~800min ~~13.3h
+%%
+%% =============================================================================
+%% Software
+%% =============================================================================
+%% Jannovar 0.16 - https://github.com/charite/jannovar
+%% GATK 3.6 - https://www.broadinstitute.org/gatk/download/
+%% FastQC 0.11.5 - http://www.bioinformatics.babraham.ac.uk/projects/fastqc/
+%% Picard-Tools 2.5.0 - https://broadinstitute.github.io/picard/  
+%% Samtools 1.3.1 - http://www.htslib.org/doc/samtools.html
+%% STAR 2.5.2a - https://github.com/alexdobin/STAR
+%%
+%% =============================================================================
+%% Task definitions
+%% =============================================================================
+
+%% unzip the input file
+deftask gunzip( decompressed( File ) : [gz( File ) name] ) in bash *{    
+    touch gunzip.step
+    decompressed=$name
+    gzip -c -d $gz > $decompressed
+}*
+
+%% FastQC
+deftask fastqc( zip( File ) : fq( File ) )in bash *{
+    touch fastqc.$fq.step
+    fastqc -f fastq --noextract -o ./ $fq
+    zip=`ls *.zip`
+}*
+
+deftask createDict( dict( File ) : ref( File ) ) in bash *{
+    dict=reference.dict
+    picard CreateSequenceDictionary R=$ref O=$dict
+}*
+
+deftask createFai( fai( File ) : ref( File ) ) in bash *{
+    fai=$ref.fai
+    samtools faidx $ref
+}*
+
+%% Map to Reference with STAR 2-pass
+%% reference - A reference file in .fa format, for example hg19.fa
+deftask prepareAlignment( genomeDir : reference( File ) threads ) in bash *{
+        src=$(pwd)
+        touch twoPass.$reference.step
+        genomeDir=$src/hg19_1pass
+        mkdir $genomeDir
+        # building genome index from reference
+        STAR --runMode genomeGenerate --genomeDir $genomeDir --genomeFastaFiles $reference --runThreadN $threads
+    }*
+
+
+    deftask twoPassAlignment( sam(File) : reference( File ) [mate1( File ) mate2( File )] threads genDir ) in bash *{
+        src=$(pwd)
+        touch twoPass.$mate1.step
+        
+        pass1path=$src/pass1
+		mkdir $pass1path
+		cd $pass1path
+		STAR --genomeDir $genDir --readFilesIn $src/$mate1 $src/$mate2 --runThreadN $threads
+		
+        cd ..
+		gDir=$src/hg19_2pass
+		mkdir $gDir
+		STAR --runMode genomeGenerate --genomeDir $gDir --genomeFastaFiles $src/$reference \
+    		--sjdbFileChrStartEnd $pass1path/SJ.out.tab --sjdbOverhang 75 --runThreadN $threads
+    	
+    	runDir=$src/pass2
+		mkdir $runDir
+		cd $runDir
+		STAR --genomeDir $gDir --readFilesIn $src/$mate1 $src/$mate2 --runThreadN $threads
+		#produces a SAM file, which we then put through the usual Picard processing steps
+        sam=out.sam
+        cp Aligned.out.sam $src/out.sam
+    }*
+
+
+%% Mark Duplicates and sort with Picard
+deftask addOrReplaceReadGroups( bam( File ) : [sam( File ) sequencename]) in bash *{
+    bam=rg_added_sorted.bam
+    touch addOrReplaceReadGroups.$sequencename.step
+    picard AddOrReplaceReadGroups I=$sam O=$bam SO=coordinate RGID=1 RGLB=library RGPL=ILLUMINA RGPU=machine RGSM=$sequencename 
+}*
+
+deftask markDuplicates( dedup( File ) dbai( File ): [bam( File ) sequencename]) in bash *{
+    dedup=dedupped.bam
+    dbai=dedupped.bai
+    touch MarkDuplicates.$sequencename.step
+    picard MarkDuplicates I=$bam O=$dedup  CREATE_INDEX=true VALIDATION_STRINGENCY=SILENT M=output.metrics
+}*
+
+deftask splitNCigarReads( split( File ) sbai( File ) : [ref( File ) reffai( File ) refdict( File )] [dedup( File ) dbai( File ) sequencename]) in bash *{
+    touch splitNCigarReads.$sequencename.step
+    split=split.bam
+    sbai=split.bai
+    ln -sf $ref reference.fasta
+    ln -sf $reffai reference.fasta.fai
+    ln -sf $refdict reference.dict
+    ln -sf $dedup input.bam
+    ln -sf $dbai input.bai
+    gatk -T SplitNCigarReads -R reference.fasta -I input.bam -o $split -rf ReassignOneMappingQuality -RMQF 255 -RMQT 60 -U ALLOW_N_CIGAR_READS
+}*
+
+
+%% Indel Realignment (Optional)
+% After the splitting step, we resume our regularly scheduled programming... to some extent. We have found that performing realignment around indels can help rescue a few indels that would otherwise be missed, but to be honest the effect is marginal. So while it can’t hurt to do it, we only recommend performing the realignment step if you have compute and time to spare (or if it’s important not to miss any potential indels).
+
+% inte = targetCreator( ref:genome, reffai:fai, refdict:dict, known:knownf );
+deftask targetCreator( interval( File ) : [ref( File ) reffai( File ) refdict( File )] known( File ) ) in bash *{
+    touch RealignerTargetCreator.step
+    interval=target.intervals
+    ln -sf $ref reference.fasta
+    ln -sf $reffai reference.fasta.fai
+    ln -sf $refdict reference.dict
+    gatk -T RealignerTargetCreator -R reference.fasta -o $interval -known $known
+}*
+        
+deftask indelRealignment( realigned( File ) : [ref( File ) reffai( File ) refdict( File )] known( File ) interval( File ) [inputBam( File ) inputbai( File ) sequencename] ) in bash *{
+    touch IndelRealigner.$sequencename.step
+    realigned=realignedBam.bam
+    ln -sf $ref reference.fasta
+    ln -sf $reffai reference.fasta.fai
+    ln -sf $refdict reference.dict
+    ln -sf $inputBam input.bam
+    ln -sf $inputbai input.bai
+    gatk -T IndelRealigner  -R reference.fasta -I input.bam -known $known -targetIntervals $interval -o $realigned
+}*
+    
+%% Base Recalibration (Optional)
+deftask recalibrate( groups( File ) : [ref( File ) reffai( File ) refdict( File )] known( File ) [inputBam( File ) sequencename] ) in bash *{
+    touch BaseRecalibrator.$sequencename.step
+    groups=recal_data.grp
+    ln -sf $ref reference.fasta
+    ln -sf $reffai reference.fasta.fai
+    ln -sf $refdict reference.dict
+    ln -sf $inputBam input.bam
+    gatk -T BaseRecalibrator -R reference.fasta -I input.bam -knownSites $known -o $groups
+}*
+
+deftask printReads( recalibrated( File ) : [ref( File ) reffai( File ) refdict( File )] [inputBam( File ) groups( File ) sequencename] ) in bash *{
+    touch PrintReads.$sequencename.step
+    recalibrated=recalibrated.bam
+    ln -sf $ref reference.fasta
+    ln -sf $reffai reference.fasta.fai
+    ln -sf $refdict reference.dict
+    ln -sf $inputBam input.bam
+    gatk -T PrintReads -R reference.fasta -I input.bam -BQSR $groups -o $recalibrated
+}*
+
+%% Variant Calling, HC in RNAseq mode
+deftask variantcall( called( File ) : [ref( File ) reffai( File ) refdict( File ) referencename ] [inputBam( File ) sequencename] ) in bash *{
+    touch HaplotypeCaller.$sequencename.$referencename.step
+    called=$sequencename.$referencename.vcf
+    ln -sf $ref reference.fasta
+    ln -sf $reffai reference.fasta.fai
+    ln -sf $refdict reference.dict
+    ln -sf $inputBam input.bam
+    gatk -T HaplotypeCaller -R reference.fasta -I input.bam -dontUseSoftClippedBases -stand_call_conf 20.0 -stand_emit_conf 20.0 -o $called
+}*
+
+%% use raw variants (SNPs and Indels) for variant filtering with RNAsq-specific settings
+deftask filter( filtered( File ) : [ref( File ) reffai( File ) refdict( File ) referencename] [inputVcf( File ) sequencename] ) in bash *{
+    touch VariantFiltration.$sequencename.$referencename.step
+    filtered=$sequencename.filtered.$referencename.vcf
+    ln -sf $ref reference.fasta
+    ln -sf $reffai reference.fasta.fai
+    ln -sf $refdict reference.dict
+    gatk -T VariantFiltration -R reference.fasta -V $inputVcf -window 35 -cluster 3 --filterName FS --filterExpression "FS>30.0" --filterName QD --filterExpression "QD<2.0" -o $filtered 
+}*
+    
+%% =============================================================================
+%% Settings
+%% =============================================================================
+% maximum number of cores you want to use for alignment
+cores = 12;
+
+%% =============================================================================
+%% General input files
+%% =============================================================================
+
+genome = "files/Homo_sapiens_assembly38.fasta";
+refname = "hg38";
+knownf = "files/Mills_and_1000G_gold_standard.indels.hg38.vcf";
+
+%% =============================================================================
+%% Target definitions
+%% =============================================================================
+
+qc = fastqc( fq: fq1gz fq2gz );
+dict = createDict( ref:genome );
+fai = createFai( ref:genome );
+
+fq1 = gunzip(gz: fq1gz, name:"fq1");
+fq2 = gunzip(gz: fq2gz, name:"fq2");
+
+gDir = prepareAlignment( reference:genome, threads:cores );
+samf = twoPassAlignment( reference:genome, mate1:fq1, mate2:fq2, threads:cores, genDir: gDir );
+bamf = addOrReplaceReadGroups( sam:samf, sequencename:sequence );
+dedupbam dedbai = markDuplicates( bam:bamf, sequencename:sequence );
+splitted splibai = splitNCigarReads( ref:genome, reffai:fai, refdict: dict, dedup:dedupbam, dbai:dedbai, sequencename:sequence );
+
+inte = targetCreator( ref:genome, reffai:fai, refdict: dict, known:knownf );
+rea = indelRealignment( ref:genome, reffai:fai, refdict: dict, known:knownf, inputBam:splitted, inputbai:splibai, interval:inte, sequencename:sequence );
+
+grps = recalibrate( ref:genome, reffai:fai, refdict: dict, known:knownf, inputBam:rea, sequencename:sequence );
+rcl = printReads( ref:genome, reffai:fai, refdict: dict, inputBam:rea, sequencename:sequence, groups:grps );
+
+vcf = variantcall( ref:genome, reffai:fai, refdict: dict, inputBam:rcl, sequencename:sequence, referencename:refname );
+filtered = filter( ref:genome, reffai:fai, refdict: dict, inputVcf:vcf, sequencename:sequence, referencename:refname );
+
+%% =============================================================================
+%% Define the run-specific input files and declare the goal
+%% =============================================================================
+
+fq1gz = "files/SRR629569_1.fastq";
+fq2gz = "files/SRR629569_2.fastq";
+sequence = "SRR629569";
+
+qc filtered;
