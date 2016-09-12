@@ -11,8 +11,8 @@ url_base = "ftp://ftp.ddbj.nig.ac.jp/ddbj_database/dra/fastq/SRA062/SRA062599/SR
 url_id = "SRR629569"
 
 hg38_url_base = "ftp://gsapubftp-anonymous:@ftp.broadinstitute.org/bundle/hg38/hg38bundle"
-hg38_filelist = ["Homo_sapiens_assembly38.fasta.gz",
-                 "Mills_and_1000G_gold_standard.indels.hg38.vcf.gz"]
+hg38_filelist = ["Homo_sapiens_assembly38.fasta",
+                 "Mills_and_1000G_gold_standard.indels.hg38.vcf"]
 
 
 
@@ -29,10 +29,10 @@ directory fq_dir
     action :create_if_missing
     source url
     retries 1
-    not_if File.exists?( fq )
+    not_if "#{File.exists?( fq )}"
   end
 
-  bash "extract_fq_#{i}" do
+  bash "extract_#{fq_bz2}" do
     code "bunzip2 #{fq_bz2}"
     creates fq
   end
@@ -41,9 +41,18 @@ directory fq_dir
 
 hg38_filelist.each { |file|
 
-  remote_file "#{hg38_dir}/#{file}" do
+  f_gz = "#{hg38_dir}/#{file}.gz"
+  f    = "#{hg38_dir}/#{file}"
+
+  remote_file f_gz do
     action :create_if_missing
-    source "#{hg38_url_base}/#{file}"
+    source "#{hg38_url_base}/#{file}.gz"
     retries 1
+    not_if "#{File.exists?( f )}"
+  end
+
+  bash "extract_#{f_gz}" do
+    code "gunzip #{f_gz}"
+    creates f
   end
 }
