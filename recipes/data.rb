@@ -15,16 +15,29 @@ hg38_filelist = ["Homo_sapiens_assembly38.fasta.gz",
                  "Mills_and_1000G_gold_standard.indels.hg38.vcf.gz"]
 
 
-url = "#{url_base}/#{url_id}_1.fastq.bz2"
 
 directory node["dir"]["data"]
 directory fq_dir
 
-remote_file "#{fq_dir}/#{File.basename( url )}" do
-  action :create_if_missing
-  source url
-  retries 1
-end
+["1", "2"].each { |i|
+
+  url    = "#{url_base}/#{url_id}_#{i}.fastq.bz2"
+  fq_bz2 = "#{fq_dir}/#{File.basename( url )}"
+  fq     = "#{fq_dir}/#{url_id}_#{i}.fastq"
+
+  remote_file fq_bz2 do
+    action :create_if_missing
+    source url
+    retries 1
+    not_if File.exists?( fq )
+  end
+
+  bash "extract_fq_#{i}" do
+    code "bunzip2 #{fq_bz2}"
+    creates fq
+  end
+
+}
 
 hg38_filelist.each { |file|
 
