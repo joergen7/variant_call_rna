@@ -6,3 +6,7 @@
 
 include_recipe "chef-bioinf-worker::picard"
 incluce_recipe "chef-bioinf-worker::gatk"
+include_recipe "chef-bioinf-worker::fastqc"
+include_recipe "chef-bioinf-worker::samtools"
+include_recipe "chef-bioinf-worker::star"
+include_recipe "chef-bioinf-worker::jannovar"
